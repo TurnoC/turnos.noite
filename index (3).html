@@ -1,0 +1,978 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>🌙 Gestão de Turnos Noturnos</title>
+  <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.23.5/babel.min.js"></script>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#0d0d1a;font-family:'Courier New',monospace;}
+    ::-webkit-scrollbar{width:6px;height:6px;}
+    ::-webkit-scrollbar-track{background:#1a1a3e;}
+    ::-webkit-scrollbar-thumb{background:#5b21b6;border-radius:3px;}
+    select option{background:#1a1a3e;color:#e2e2f0;}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef } = React;
+
+
+// ─── Persistence ──────────────────────────────────────────────────────────
+const STORAGE_KEY = "turnos_noite_v6";
+const load = () => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)||"null"); } catch { return null; } };
+const save = (d) => { try { localStorage.setItem(STORAGE_KEY,JSON.stringify(d)); } catch {} };
+const initState = () => ({ pessoas:[], turno:[], noites:[] });
+
+// ─── Normalise text (accent-insensitive search) ───────────────────────────
+const norm = (s) => (s||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase();
+
+// ─── Stats ────────────────────────────────────────────────────────────────
+// noite atrib fields:
+//   pessoaId, beneficio, porEscolha, eraTurno
+//   balda: bool
+//   prefIndiferente: "primeiras"|"segundas"|null  (for indiferente people who marked preference)
+//   sacrificioIndiferente: bool  (for indiferente people forced to wrong part)
+//
+// Sacrifice logic (new):
+//   sacrificioCount / (nPrimeiras + nSegundas - nIndiferenteSemMarca + 0.0000001)
+//   where nIndiferenteSemMarca = noites where person was indiferente AND neither pref nor sacrificio marked
+
+const p2 = (v) => parseFloat(v.toFixed(2));
+
+function calcStats(pessoa, noites, turnoAtual) {
+  const pref = pessoa.preferencia;
+  const h = pessoa.historico||{};
+  const hF = pessoa.historicoFora||{};
+
+  // Manual historico (turno)
+  let nPt=h.nPrimeiras||0, nSt=h.nSegundas||0;
+  let pBt=h.primBom||0, pMt=h.primMau||0, sBt=h.segBom||0, sMt=h.segMau||0;
+  let pBaldaT=h.primBalda||0, sBaldaT=h.segBalda||0;
+  let contrTurno=h.sacrificios||0;
+  let denomTurno=nPt+nSt-(h.indiferenteSemMarca||0);
+
+  // Manual historico (fora)
+  let nPf=hF.nPrimeiras||0, nSf=hF.nSegundas||0;
+  let pBf=hF.primBom||0, pMf=hF.primMau||0, sBf=hF.segBom||0, sMf=hF.segMau||0;
+  let pBaldaF=hF.primBalda||0, sBaldaF=hF.segBalda||0;
+  let contrFora=hF.sacrificios||0;
+  let denomFora=nPf+nSf-(hF.indiferenteSemMarca||0);
+
+  // From registered noites
+  noites.forEach((n) => {
+    const pa=n.primeiras?.find((a)=>a.pessoaId===pessoa.id);
+    const sa=n.segundas?.find((a)=>a.pessoaId===pessoa.id);
+    const atrib=pa||sa;
+    if(!atrib) return;
+    const wasTurno=!!atrib.eraTurno;
+
+    if(pa){
+      if(wasTurno){ nPt++; if(pa.beneficio==="bom") pBt++; if(pa.beneficio==="mau") pMt++; if(pa.balda) pBaldaT++; }
+      else         { nPf++; if(pa.beneficio==="bom") pBf++; if(pa.beneficio==="mau") pMf++; if(pa.balda) pBaldaF++; }
+    }
+    if(sa){
+      if(wasTurno){ nSt++; if(sa.beneficio==="bom") sBt++; if(sa.beneficio==="mau") sMt++; if(sa.balda) sBaldaT++; }
+      else         { nSf++; if(sa.beneficio==="bom") sBf++; if(sa.beneficio==="mau") sMf++; if(sa.balda) sBaldaF++; }
+    }
+
+    // Sacrifice calculation
+    if(pref==="primeiras"||pref==="segundas"){
+      const contr=pref==="primeiras"?"segundas":"primeiras";
+      const naContr=n[contr]?.find((a)=>a.pessoaId===pessoa.id);
+      const naPref=n[pref]?.find((a)=>a.pessoaId===pessoa.id);
+      if(naContr||naPref){
+        if(wasTurno){ denomTurno++; if(naContr&&!naContr.porEscolha) contrTurno++; }
+        else         { denomFora++;  if(naContr&&!naContr.porEscolha) contrFora++;  }
+      }
+    } else {
+      // indiferente
+      const hasPreference=!!(atrib.prefIndiferente);
+      const hasSacrificio=!!(atrib.sacrificioIndiferente);
+      if(hasPreference||hasSacrificio){
+        if(wasTurno){ denomTurno++; if(hasSacrificio) contrTurno++; }
+        else         { denomFora++;  if(hasSacrificio) contrFora++;  }
+      } else {
+        // no mark — excluded from denominator (already not counted)
+      }
+    }
+  });
+
+  const pctB=(b,n)=>n===0?0:p2((b/n)*100);
+  const pctSac=(c,d)=>p2((c/(d+0.0000001))*100);
+
+  return {
+    turno:{
+      nPrimeiras:nPt, nSegundas:nSt,
+      primBom:pBt, primMau:pMt, segBom:sBt, segMau:sMt,
+      primBalda:pBaldaT, segBalda:sBaldaT,
+      pctPrimBom:pctB(pBt,nPt), pctPrimMau:pctB(pMt,nPt),
+      pctSegBom:pctB(sBt,nSt),  pctSegMau:pctB(sMt,nSt),
+      pctPrimBalda:pctB(pBaldaT,nPt), pctSegBalda:pctB(sBaldaT,nSt),
+      pctContraria:pctSac(contrTurno,denomTurno),
+      contrariaCount:contrTurno, totalPref:denomTurno,
+    },
+    fora:{
+      nPrimeiras:nPf, nSegundas:nSf,
+      primBom:pBf, primMau:pMf, segBom:sBf, segMau:sMf,
+      primBalda:pBaldaF, segBalda:sBaldaF,
+      pctPrimBom:pctB(pBf,nPf), pctPrimMau:pctB(pMf,nPf),
+      pctSegBom:pctB(sBf,nSf),  pctSegMau:pctB(sMf,nSf),
+      pctPrimBalda:pctB(pBaldaF,nPf), pctSegBalda:pctB(sBaldaF,nSf),
+      pctContraria:pctSac(contrFora,denomFora),
+      contrariaCount:contrFora, totalPref:denomFora,
+    },
+  };
+}
+
+// ─── Alerta duas noites seguidas com benefício ────────────────────────────
+function alertasDuasNoites(pessoaId, noites) {
+  if(noites.length<2) return false;
+  const sorted=[...noites].sort((a,b)=>new Date(a.data)-new Date(b.data));
+  for(let i=sorted.length-1;i>=1;i--){
+    const temB=(n)=>{
+      const p=n.primeiras?.find((a)=>a.pessoaId===pessoaId);
+      const s=n.segundas?.find((a)=>a.pessoaId===pessoaId);
+      return (p&&p.beneficio!=="nenhum")||(s&&s.beneficio!=="nenhum");
+    };
+    if(temB(sorted[i-1])&&temB(sorted[i])) return true;
+  }
+  return false;
+}
+
+// ─── Export modal ─────────────────────────────────────────────────────────
+function ModalExport({state,onClose}){
+  const json=JSON.stringify(state,null,2);
+  const [copied,setCopied]=useState(false);
+  const copy=()=>{ navigator.clipboard.writeText(json).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),2000);}); };
+  return (
+    <div style={{position:"fixed",inset:0,background:"#000c",display:"flex",alignItems:"center",justifyContent:"center",zIndex:300}}
+      onClick={(e)=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:"#12122a",border:"1px solid #3d3d7a",borderRadius:14,padding:24,width:"min(600px,96vw)",maxHeight:"85vh",display:"flex",flexDirection:"column",gap:12}}>
+        <div style={{fontWeight:900,fontSize:15,color:"#a78bfa",letterSpacing:2}}>⬇ EXPORTAR DADOS</div>
+        <div style={{fontSize:12,color:"#6b6b9a"}}>Copia o texto e guarda num ficheiro <strong style={{color:"#e2e2f0"}}>.json</strong>.</div>
+        <textarea readOnly value={json} style={{flex:1,minHeight:300,background:"#0d0d1a",border:"1px solid #3d3d7a",borderRadius:6,padding:10,color:"#a8c8a8",fontFamily:"monospace",fontSize:11,resize:"none"}} onClick={(e)=>e.target.select()}/>
+        <div style={{display:"flex",gap:10,justifyContent:"flex-end"}}>
+          <button onClick={onClose} style={{background:"#2a2a4a",color:"#fff",border:"none",borderRadius:6,padding:"9px 18px",cursor:"pointer",fontFamily:"inherit",fontWeight:700,fontSize:12}}>Fechar</button>
+          <button onClick={copy} style={{background:copied?"#166534":"#5b21b6",color:"#fff",border:"none",borderRadius:6,padding:"9px 18px",cursor:"pointer",fontFamily:"inherit",fontWeight:700,fontSize:12}}>{copied?"✓ Copiado!":"📋 Copiar tudo"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+async function parseNomesCSV(file){
+  return new Promise((res,rej)=>{
+    const reader=new FileReader();
+    reader.onload=(e)=>{ const nomes=[]; e.target.result.split(/\r?\n/).forEach((line)=>{ line.split(",").forEach((n)=>{ const t=n.trim(); if(t&&t.length>1) nomes.push(t); }); }); res(nomes); };
+    reader.onerror=rej; reader.readAsText(file);
+  });
+}
+
+// ─── Styles ───────────────────────────────────────────────────────────────
+const INP={background:"#1a1a3e",border:"1px solid #3d3d7a",borderRadius:6,padding:"9px 13px",color:"#e2e2f0",fontFamily:"inherit",fontSize:13,width:"100%",boxSizing:"border-box"};
+const BTN=(bg="#5b21b6",extra={})=>({background:bg,color:"#fff",border:"none",borderRadius:6,padding:"9px 18px",cursor:"pointer",fontFamily:"inherit",fontWeight:700,fontSize:12,letterSpacing:1,...extra});
+const LBL={fontSize:11,color:"#6b6b9a",letterSpacing:1,display:"block",marginBottom:4};
+const CARD={background:"#1a1a3e",border:"1px solid #3d3d7a",borderRadius:10,padding:16,marginBottom:12};
+const PREF_ICON={primeiras:"🌑",segundas:"🌒",indiferente:"↔"};
+const PREF_COR={primeiras:"#818cf8",segundas:"#fb923c",indiferente:"#6b7280"};
+const pi=(p)=>PREF_ICON[p?.preferencia||"indiferente"]||"↔";
+const pc=(p)=>PREF_COR[p?.preferencia||"indiferente"]||"#6b7280";
+const BEN_COR={primBom:"#e6b800",primMau:"#e67300",segBom:"#1a6fbf",segMau:"#7b2fbf"};
+const MESES=["Janeiro","Fevereiro","Março","Abril","Maio","Junho","Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"];
+const DIAS_PT_FULL=["Domingo","Segunda-Feira","Terça-Feira","Quarta-Feira","Quinta-Feira","Sexta-Feira","Sábado"];
+
+// ─── Autocomplete (accent-insensitive) ───────────────────────────────────
+function Autocomplete({value,onChange,options,onSelect,placeholder,disabled}){
+  const [open,setOpen]=useState(false);
+  const ref=useRef();
+  useEffect(()=>{ const h=(e)=>{ if(ref.current&&!ref.current.contains(e.target)) setOpen(false); }; document.addEventListener("mousedown",h); return ()=>document.removeEventListener("mousedown",h); },[]);
+  const filtered=value.length>0?options.filter((s)=>norm(s).includes(norm(value))):options.slice(0,10);
+  return (
+    <div ref={ref} style={{position:"relative",flex:1}}>
+      <input value={value} onChange={(e)=>{onChange(e.target.value);setOpen(true);}} onFocus={()=>setOpen(true)} placeholder={placeholder} disabled={disabled} style={{...INP,opacity:disabled?0.5:1}}/>
+      {open&&filtered.length>0&&(
+        <div style={{position:"absolute",top:"100%",left:0,right:0,background:"#1a1a3e",border:"1px solid #5b21b6",borderRadius:"0 0 8px 8px",zIndex:200,maxHeight:200,overflowY:"auto",boxShadow:"0 8px 24px #0008"}}>
+          {filtered.map((s)=>(
+            <div key={s} onClick={()=>{onSelect(s);setOpen(false);onChange("");}} style={{padding:"9px 13px",cursor:"pointer",fontSize:13,borderBottom:"1px solid #2a2a4a"}} onMouseEnter={(e)=>e.currentTarget.style.background="#2a2a5a"} onMouseLeave={(e)=>e.currentTarget.style.background="transparent"}>{s}</div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Modal Perfil ─────────────────────────────────────────────────────────
+function ModalPerfil({pessoa,noites,turno,onSave,onClose}){
+  const [nome,setNome]=useState(pessoa.nome);
+  const [pref,setPref]=useState(pessoa.preferencia||"indiferente");
+  const h0=pessoa.historico||{};
+  const hF0=pessoa.historicoFora||{};
+  const [h,setH]=useState({nPrimeiras:h0.nPrimeiras||0,nSegundas:h0.nSegundas||0,primBom:h0.primBom||0,primMau:h0.primMau||0,segBom:h0.segBom||0,segMau:h0.segMau||0,primBalda:h0.primBalda||0,segBalda:h0.segBalda||0,sacrificios:h0.sacrificios||0,indiferenteSemMarca:h0.indiferenteSemMarca||0});
+  const [hF,setHF]=useState({nPrimeiras:hF0.nPrimeiras||0,nSegundas:hF0.nSegundas||0,primBom:hF0.primBom||0,primMau:hF0.primMau||0,segBom:hF0.segBom||0,segMau:hF0.segMau||0,primBalda:hF0.primBalda||0,segBalda:hF0.segBalda||0,sacrificios:hF0.sacrificios||0,indiferenteSemMarca:hF0.indiferenteSemMarca||0});
+  const [fieldEditing,setFieldEditing]=useState(null);
+  const sf=(setFn)=>(k)=>(e)=>setFn((p)=>({...p,[k]:parseFloat(e.target.value)||0}));
+  const stats=calcStats({...pessoa,preferencia:pref,historico:h,historicoFora:hF},noites,turno);
+  const st=stats.turno, sf2=stats.fora;
+
+  const startEdit=(grupo,field,vals,mode)=>{
+    const base=field==="primBom"||field==="primMau"||field==="primBalda"?"nPrimeiras":"nSegundas";
+    const currentAbs=vals[field]||0;
+    const currentBase=vals[base]||0;
+    const draft=mode==="absoluto"?String(currentAbs):(currentBase>0?p2((currentAbs/currentBase)*100).toString():"0");
+    setFieldEditing({grupo,field,mode,draft,base});
+  };
+
+  const cancelEdit=()=>setFieldEditing(null);
+
+  const applyEdit=(setFn,vals)=>{
+    if(!fieldEditing) return;
+    const val=parseFloat(fieldEditing.draft.replace(",","."));
+    if(isNaN(val)) { setFieldEditing(null); return; }
+    let abs;
+    if(fieldEditing.mode==="absoluto"){ abs=Math.round(val); }
+    else { const base=vals[fieldEditing.base]||0; abs=Math.round(val/100*base); }
+    setFn(p=>({...p,[fieldEditing.field]:abs}));
+    setFieldEditing(null);
+  };
+
+  const FIELDS_P=[["primBom","Bom"],["primMau","Mau"],["primBalda","Balda"]];
+  const FIELDS_S=[["segBom","Bom"],["segMau","Mau"],["segBalda","Balda"]];
+
+  const FieldRow=({grupo,field,label,vals,setFn,base})=>{
+    const isEditing=fieldEditing&&fieldEditing.grupo===grupo&&fieldEditing.field===field;
+    const isSacrificio=field==="sacrificios";
+    const absVal=vals[field]||0;
+    const baseVal=vals[base]||0;
+    const pctVal=baseVal>0?p2((absVal/baseVal)*100):0;
+    return (
+      <div style={{display:"flex",alignItems:"center",gap:6,padding:"5px 0",borderBottom:"1px solid #1a1a2a"}}>
+        <span style={{width:60,fontSize:11,color:"#6b6b9a"}}>{label}</span>
+        {!isEditing?(
+          <>
+            <span style={{flex:1,fontSize:12,color:"#e2e2f0"}}><b>{absVal}</b> {!isSacrificio&&<span style={{color:"#4b5563"}}>({pctVal}%)</span>}</span>
+            <button onClick={()=>startEdit(grupo,field,vals,"absoluto")} style={{...BTN("#2a2a5a"),fontSize:10,padding:"2px 8px"}}>✏️ #</button>
+            {!isSacrificio&&<button onClick={()=>startEdit(grupo,field,vals,"percentagem")} style={{...BTN("#1a2a1a"),fontSize:10,padding:"2px 8px"}}>✏️ %</button>}
+          </>
+        ):(
+          <>
+            <input
+              autoFocus
+              type="text" inputMode="decimal"
+              value={fieldEditing.draft}
+              onChange={e=>setFieldEditing(prev=>({...prev,draft:e.target.value}))}
+              onKeyDown={e=>{ if(e.key==="Enter") applyEdit(setFn,vals); if(e.key==="Escape") cancelEdit(); }}
+              style={{...INP,flex:1,padding:"4px 8px",fontSize:12,borderColor:"#f59e0b"}}
+            />
+            <span style={{fontSize:10,color:"#f59e0b"}}>{fieldEditing.mode==="percentagem"?"%":"#"}</span>
+            <button onClick={()=>applyEdit(setFn,vals)} style={{...BTN("#166534"),fontSize:10,padding:"2px 8px"}}>✓</button>
+            <button onClick={cancelEdit} style={{...BTN("#3d1a1a"),fontSize:10,padding:"2px 8px"}}>✕</button>
+          </>
+        )}
+      </div>
+    );
+  };
+
+  const ColForm=({title,vals,setFn,color,grupo})=>(
+    <div style={{background:"#0d0d22",border:`1px solid ${color}44`,borderRadius:8,padding:12}}>
+      <div style={{fontSize:11,color,letterSpacing:1,marginBottom:10,fontWeight:700}}>{title}</div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,fontSize:11,marginBottom:10}}>
+        <div>
+          <label style={LBL}>Nº Noites Prim.</label>
+          <input type="number" min={0} value={vals.nPrimeiras} onChange={sf(setFn)("nPrimeiras")} style={INP}/>
+        </div>
+        <div>
+          <label style={LBL}>Nº Noites Seg.</label>
+          <input type="number" min={0} value={vals.nSegundas} onChange={sf(setFn)("nSegundas")} style={INP}/>
+        </div>
+      </div>
+      <div style={{marginBottom:8}}>
+        <div style={{fontSize:10,color:"#818cf8",fontWeight:700,marginBottom:4,letterSpacing:1}}>🌑 PRIMEIRAS</div>
+        {FIELDS_P.map(([field,label])=><FieldRow key={field} grupo={grupo} field={field} label={label} vals={vals} setFn={setFn} base="nPrimeiras"/>)}
+      </div>
+      <div style={{marginBottom:8}}>
+        <div style={{fontSize:10,color:"#fb923c",fontWeight:700,marginBottom:4,letterSpacing:1}}>🌒 SEGUNDAS</div>
+        {FIELDS_S.map(([field,label])=><FieldRow key={field} grupo={grupo} field={field} label={label} vals={vals} setFn={setFn} base="nSegundas"/>)}
+      </div>
+      <div style={{paddingTop:6,borderTop:"1px solid #1a1a2a"}}>
+        <FieldRow grupo={grupo} field="sacrificios" label="Sacrifícios" vals={vals} setFn={setFn} base="nPrimeiras"/>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"#000c",display:"flex",alignItems:"center",justifyContent:"center",zIndex:300}} onClick={(e)=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:"#12122a",border:"1px solid #5b21b6",borderRadius:14,padding:24,width:"min(700px,98vw)",maxHeight:"94vh",overflowY:"auto"}}>
+        <div style={{fontWeight:900,fontSize:16,color:"#a78bfa",marginBottom:16,letterSpacing:2}}>👤 PERFIL — {pessoa.nome}</div>
+        <label style={LBL}>NOME</label>
+        <input value={nome} onChange={(e)=>setNome(e.target.value)} style={{...INP,marginBottom:14}}/>
+        <label style={LBL}>PREFERÊNCIA</label>
+        <div style={{display:"flex",gap:8,marginBottom:16}}>
+          {[["primeiras","🌑 Primeiras"],["segundas","🌒 Segundas"],["indiferente","↔ Indiferente"]].map(([v,l])=>(
+            <button key={v} onClick={()=>setPref(v)} style={{...BTN(pref===v?"#5b21b6":"#2a2a4a"),flex:1,border:`1px solid ${pref===v?"#a78bfa":"#3d3d7a"}`}}>{l}</button>
+          ))}
+        </div>
+        {/* Two columns: turno | fora */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+          <ColForm title="📋 TURNO" vals={h} setFn={setH} color="#a78bfa" grupo="turno"/>
+          <ColForm title="📋 FORA DO TURNO" vals={hF} setFn={setHF} color="#6b9a6b" grupo="fora"/>
+        </div>
+        {/* Stats summary */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:16}}>
+          {[["📊 Totais Turno",st],["📊 Totais Fora",sf2]].map(([title,s])=>(
+            <div key={title} style={{background:"#0d1a0d",border:"1px solid #2d5a2d",borderRadius:8,padding:10,fontSize:11}}>
+              <div style={{color:"#4ade80",fontWeight:700,marginBottom:6}}>{title}</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:2,color:"#a8c8a8"}}>
+                <span>Prim: <b>{s.nPrimeiras}</b></span><span>Seg: <b>{s.nSegundas}</b></span>
+                <span>P.Bom: <b>{s.primBom}</b>({s.pctPrimBom}%)</span><span>S.Bom: <b>{s.segBom}</b>({s.pctSegBom}%)</span>
+                <span>P.Mau: <b>{s.primMau}</b>({s.pctPrimMau}%)</span><span>S.Mau: <b>{s.segMau}</b>({s.pctSegMau}%)</span>
+                <span>P.Balda: <b>{s.primBalda}</b>({s.pctPrimBalda}%)</span><span>S.Balda: <b>{s.segBalda}</b>({s.pctSegBalda}%)</span>
+                <span style={{gridColumn:"1/-1",color:"#ffaa44"}}>Sacrifício: <b>{s.contrariaCount}</b> ({s.pctContraria}%)</span>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div style={{display:"flex",gap:10,justifyContent:"flex-end"}}>
+          <button onClick={onClose} style={BTN("#2a2a4a")}>Cancelar</button>
+          <button onClick={()=>onSave({nome,preferencia:pref,historico:h,historicoFora:hF})} style={BTN()}>Guardar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Modal Editar Noite ───────────────────────────────────────────────────
+function ModalEditarNoite({noite,state,onSave,onClose}){
+  const [primeiras,setPrimeiras]=useState(noite.primeiras.map(a=>({...a})));
+  const [segundas,setSegundas]=useState(noite.segundas.map(a=>({...a})));
+  const [searchP,setSearchP]=useState("");
+  const [searchS,setSearchS]=useState("");
+  const pById=(id)=>state.pessoas.find((p)=>p.id===id);
+
+  const setField=(lista,setL,pid,field,val)=>setL(prev=>prev.map(a=>a.pessoaId===pid?{...a,[field]:val}:a));
+
+  // Remove person and add new one
+  const trocarPessoa=(setL,parte,oldPid,newNome)=>{
+    const clean=newNome.replace(/^★ /,"");
+    const novaPessoa=state.pessoas.find(p=>norm(p.nome)===norm(clean)||p.nome===clean);
+    if(!novaPessoa) return;
+    setL(prev=>prev.map(a=>a.pessoaId===oldPid?{pessoaId:novaPessoa.id,beneficio:"nenhum",porEscolha:false,eraTurno:state.turno.includes(novaPessoa.id),balda:false,prefIndiferente:null,sacrificioIndiferente:false}:a));
+  };
+
+  const removerPessoa=(setL,pid)=>setL(prev=>prev.filter(a=>a.pessoaId!==pid));
+
+  const adicionarPessoa=(lista,setL,nome)=>{
+    const clean=nome.replace(/^★ /,"");
+    const p=state.pessoas.find(pp=>norm(pp.nome)===norm(clean)||pp.nome===clean);
+    if(!p) return;
+    if(lista.find(a=>a.pessoaId===p.id)) return;
+    if(lista.length>=4) return;
+    setL(prev=>[...prev,{pessoaId:p.id,beneficio:"nenhum",porEscolha:false,eraTurno:state.turno.includes(p.id),balda:false,prefIndiferente:null,sacrificioIndiferente:false}]);
+  };
+
+  // Compute balda suggestions
+  const getBaldaSug=(pessoasDaParte,fieldBalda)=>{
+    if(!pessoasDaParte.length) return [];
+    const doT=pessoasDaParte.filter(p=>state.turno.includes(p.id));
+    const foraT=pessoasDaParte.filter(p=>!state.turno.includes(p.id));
+    const ordered=doT.length>0?[...doT,...foraT]:[...foraT];
+    const getS=(p)=>{ const s=calcStats(p,state.noites,state.turno); return state.turno.includes(p.id)?s.turno:s.fora; };
+    return [...ordered].sort((a,b)=>getS(a)[fieldBalda]-getS(b)[fieldBalda]).map(p=>({nome:p.nome,val:getS(p)[fieldBalda],isTurno:state.turno.includes(p.id)}));
+  };
+
+  const pessoasP=primeiras.map(a=>pById(a.pessoaId)).filter(Boolean);
+  const pessoasS=segundas.map(a=>pById(a.pessoaId)).filter(Boolean);
+  const baldaSugP=getBaldaSug(pessoasP,"pctPrimBalda");
+  const baldaSugS=getBaldaSug(pessoasS,"pctSegBalda");
+
+  // People not yet in this parte (for search)
+  const dispP=state.pessoas.filter(p=>!primeiras.find(a=>a.pessoaId===p.id))
+    .sort((a,b)=>{ const ta=state.turno.includes(a.id)?0:1,tb=state.turno.includes(b.id)?0:1; return ta-tb||a.nome.localeCompare(b.nome); });
+  const dispS=state.pessoas.filter(p=>!segundas.find(a=>a.pessoaId===p.id))
+    .sort((a,b)=>{ const ta=state.turno.includes(a.id)?0:1,tb=state.turno.includes(b.id)?0:1; return ta-tb||a.nome.localeCompare(b.nome); });
+
+  const renderSlot=(atrib,setL,parte,disponiveis,search,setSearch)=>{
+    const p=pById(atrib.pessoaId); if(!p) return null;
+    const isTurno=state.turno.includes(p.id);
+    const isInd=p.preferencia==="indiferente";
+    const naContraria=!isInd&&p.preferencia!==parte;
+    return (
+      <div key={atrib.pessoaId} style={{background:"#0d0d20",border:`1px solid ${isTurno?"#4a3a7a":"#2a2a4a"}`,borderRadius:7,padding:"8px 10px",marginBottom:6}}>
+        <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5,flexWrap:"wrap"}}>
+          {isTurno&&<span style={{fontSize:9,background:"#3d2d7a",color:"#c4b5fd",borderRadius:3,padding:"1px 4px",fontWeight:700}}>T</span>}
+          <span style={{color:pc(p),fontSize:12}}>{pi(p)}</span>
+          <span style={{flex:1,fontSize:13,fontWeight:600}}>{p.nome}</span>
+          {naContraria&&<span style={{fontSize:9,color:"#f59e0b",fontWeight:700}}>≠pref</span>}
+          <button onClick={()=>removerPessoa(setL,atrib.pessoaId)}
+            style={{background:"#3d1a1a",color:"#f87171",border:"none",borderRadius:4,padding:"2px 8px",cursor:"pointer",fontFamily:"inherit",fontSize:11}}>× Remover</button>
+        </div>
+        <div style={{display:"flex",gap:4,flexWrap:"wrap",alignItems:"center"}}>
+          {["nenhum","bom","mau"].map(b=>(
+            <button key={b} onClick={()=>setField(null,setL,atrib.pessoaId,"beneficio",b)}
+              style={{background:atrib.beneficio===b?(b==="bom"?"#166534":b==="mau"?"#991b1b":"#374151"):"#0d0d1a",color:b==="bom"?"#4ade80":b==="mau"?"#f87171":"#9ca3af",border:`1px solid ${b==="bom"?"#16a34a":b==="mau"?"#dc2626":"#374151"}`,borderRadius:4,padding:"2px 8px",cursor:"pointer",fontFamily:"inherit",fontSize:10,fontWeight:700}}>
+              {b==="nenhum"?"—":b.toUpperCase()}
+            </button>
+          ))}
+          <label style={{display:"flex",alignItems:"center",gap:3,fontSize:10,color:"#f59e0b",cursor:"pointer",background:"#2a1a00",border:"1px solid #f59e0b44",borderRadius:4,padding:"2px 7px"}}>
+            <input type="checkbox" checked={!!atrib.balda} onChange={e=>setField(null,setL,atrib.pessoaId,"balda",e.target.checked)} style={{accentColor:"#f59e0b"}}/>
+            Balda
+          </label>
+          {/* Por escolha: só para pessoas com preferência definida que estão na parte contrária */}
+          {naContraria&&(
+            <label style={{display:"flex",alignItems:"center",gap:3,fontSize:10,color:"#facc15",cursor:"pointer",background:"#2a2000",border:"1px solid #facc1544",borderRadius:4,padding:"2px 7px"}}>
+              <input type="checkbox" checked={!!atrib.porEscolha} onChange={e=>setField(null,setL,atrib.pessoaId,"porEscolha",e.target.checked)} style={{accentColor:"#facc15"}}/>
+              Por escolha
+            </label>
+          )}
+          {/* Indiferentes: preferência e sacrifício */}
+          {isInd&&(
+            <>
+              <label style={{display:"flex",alignItems:"center",gap:3,fontSize:10,color:"#818cf8",cursor:"pointer",background:"#1a1a30",border:"1px solid #818cf844",borderRadius:4,padding:"2px 7px"}}>
+                <input type="checkbox" checked={atrib.prefIndiferente===parte} onChange={e=>setField(null,setL,atrib.pessoaId,"prefIndiferente",e.target.checked?parte:null)} style={{accentColor:"#818cf8"}}/>
+                Preferência
+              </label>
+              <label style={{display:"flex",alignItems:"center",gap:3,fontSize:10,color:"#fb923c",cursor:"pointer",background:"#2a1a0a",border:"1px solid #fb923c44",borderRadius:4,padding:"2px 7px"}}>
+                <input type="checkbox" checked={!!atrib.sacrificioIndiferente} onChange={e=>setField(null,setL,atrib.pessoaId,"sacrificioIndiferente",e.target.checked)} style={{accentColor:"#fb923c"}}/>
+                Sacrifício
+              </label>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"#000d",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}} onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:"#0f0f24",border:"1px solid #3d3d7a",borderRadius:16,padding:24,width:"min(720px,98vw)",maxHeight:"95vh",overflowY:"auto"}}>
+        <div style={{fontWeight:900,fontSize:16,color:"#a78bfa",marginBottom:16,letterSpacing:2}}>✏️ EDITAR NOITE — {noite.data}</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:14}}>
+          {[
+            {label:"🌑 PRIMEIRAS",lista:primeiras,setL:setPrimeiras,sug:baldaSugP,parte:"primeiras",disp:dispP,search:searchP,setSearch:setSearchP},
+            {label:"🌒 SEGUNDAS", lista:segundas, setL:setSegundas, sug:baldaSugS,parte:"segundas",disp:dispS,search:searchS,setSearch:setSearchS},
+          ].map(({label,lista,setL,sug,parte,disp,search,setSearch})=>(
+            <div key={label} style={{background:"#12122a",borderRadius:10,padding:12,border:"1px solid #2a2a4a"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <span style={{fontWeight:900,fontSize:13,color:"#a78bfa",letterSpacing:1}}>{label}</span>
+                <span style={{fontSize:12,fontWeight:700,color:lista.length===4?"#4ade80":"#f59e0b"}}>{lista.length}/4</span>
+              </div>
+              {/* Add person search */}
+              {lista.length<4&&(
+                <div style={{marginBottom:10}}>
+                  <Autocomplete
+                    value={search} onChange={setSearch}
+                    options={disp.map(p=>(state.turno.includes(p.id)?"★ ":"")+p.nome)}
+                    onSelect={(nome)=>{ adicionarPessoa(lista,setL,nome); setSearch(""); }}
+                    placeholder="+ Adicionar pessoa..."/>
+                </div>
+              )}
+              {sug.length>0&&(
+                <div style={{background:"#1a1000",border:"1px solid #f59e0b33",borderRadius:6,padding:"7px 10px",marginBottom:10,fontSize:10}}>
+                  <div style={{color:"#f59e0b",fontWeight:700,marginBottom:3}}>⚡ Sugestão Balda:</div>
+                  {sug.map((item,i)=>(
+                    <div key={item.nome} style={{color:i===0?"#f59e0b":item.isTurno?"#7a6a3a":"#5a5a3a",marginBottom:1,display:"flex",gap:4}}>
+                      <span>{i+1}. {item.nome}</span>
+                      {!item.isTurno&&<span style={{fontSize:9,color:"#888",background:"#2a2a2a",borderRadius:2,padding:"0 3px"}}>F</span>}
+                      <span style={{color:"#4a3a1a"}}>({item.val}%)</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {lista.map(a=>renderSlot(a,setL,parte,disp,search,setSearch))}
+            </div>
+          ))}
+        </div>
+        <div style={{display:"flex",gap:10,justifyContent:"flex-end"}}>
+          <button onClick={onClose} style={BTN("#2a2a4a")}>Cancelar</button>
+          <button onClick={()=>onSave({...noite,primeiras,segundas})} style={BTN()}>Guardar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Modal Nova Noite ─────────────────────────────────────────────────────
+function ModalNoite({state,onClose,onGravar}){
+  const [data,setData]=useState(new Date().toISOString().slice(0,10));
+  const [pool,setPool]=useState([]);
+  const [search,setSearch]=useState("");
+  const [step,setStep]=useState(1);
+  const [primeiras,setPrimeiras]=useState([]);
+  const [segundas,setSegundas]=useState([]);
+  const [sugP,setSugP]=useState({bomList:[],mauList:[],baldaList:[]});
+  const [sugS,setSugS]=useState({bomList:[],mauList:[],baldaList:[]});
+  const pById=(id)=>state.pessoas.find((p)=>p.id===id);
+
+  const getStatsFor=(p)=>{ const s=calcStats(p,state.noites,state.turno); const useFora=!state.turno.includes(p.id)&&((p.historicoFora?.nPrimeiras||0)+(p.historicoFora?.nSegundas||0)>0); return useFora?s.fora:s.turno; };
+
+  const computeSug=(pessoas,fieldBom,fieldMau,fieldBalda)=>{
+    if(!pessoas.length) return {bomList:[],mauList:[],baldaList:[]};
+    const doT=pessoas.filter(p=>state.turno.includes(p.id));
+    const foraT=pessoas.filter(p=>!state.turno.includes(p.id));
+    const candidates=doT.length>0?doT:foraT;
+    const allOrdered=[...doT,...foraT];
+    const mk=(arr,field)=>[...arr].sort((a,b)=>getStatsFor(a)[field]-getStatsFor(b)[field]).map(p=>({nome:p.nome,val:getStatsFor(p)[field],isTurno:state.turno.includes(p.id)}));
+    const foraB=doT.length>0?[...foraT].sort((a,b)=>getStatsFor(a)[fieldBom]-getStatsFor(b)[fieldBom]).map(p=>({nome:p.nome,val:getStatsFor(p)[fieldBom],isTurno:false})):[];
+    const foraM=doT.length>0?[...foraT].sort((a,b)=>getStatsFor(a)[fieldMau]-getStatsFor(b)[fieldMau]).map(p=>({nome:p.nome,val:getStatsFor(p)[fieldMau],isTurno:false})):[];
+    const bomList=[...mk(candidates,fieldBom),...foraB];
+    const mauList=[...mk(candidates,fieldMau),...foraM];
+    const baldaList=[...mk(allOrdered,fieldBalda)];
+    return {bomList,mauList,baldaList};
+  };
+
+  const availSearch=state.pessoas.filter(p=>!pool.includes(p.id)).sort((a,b)=>{ const ta=state.turno.includes(a.id)?0:1,tb=state.turno.includes(b.id)?0:1; return ta-tb||a.nome.localeCompare(b.nome); });
+
+  const addToPool=(nome)=>{ if(pool.length>=8) return; const clean=nome.replace(/^★ /,""); const p=state.pessoas.find(pp=>norm(pp.nome)===norm(clean)||pp.nome===clean); if(p&&!pool.includes(p.id)) setPool(prev=>[...prev,p.id]); setSearch(""); };
+
+  const avancar=()=>{
+    const pessoasPool=pool.map(id=>pById(id)).filter(Boolean);
+    const getPct=(p)=>getStatsFor(p).pctContraria;
+    const doTurno=pessoasPool.filter(p=>state.turno.includes(p.id));
+    const foraTurno=pessoasPool.filter(p=>!state.turno.includes(p.id));
+    const primIds=[],segIds=[];
+    const tPrefP=doTurno.filter(p=>p.preferencia==="primeiras"),tPrefS=doTurno.filter(p=>p.preferencia==="segundas"),tInd=doTurno.filter(p=>!p.preferencia||p.preferencia==="indiferente");
+    if(tPrefP.length<=4) tPrefP.forEach(p=>primIds.push(p.id)); else [...tPrefP].sort((a,b)=>getPct(b)-getPct(a)).forEach((p,i)=>{ if(i<4) primIds.push(p.id); else segIds.push(p.id); });
+    const slotsS1=4-segIds.length;
+    if(tPrefS.length<=slotsS1) tPrefS.forEach(p=>segIds.push(p.id)); else [...tPrefS].sort((a,b)=>getPct(b)-getPct(a)).forEach((p,i)=>{ if(i<slotsS1) segIds.push(p.id); else primIds.push(p.id); });
+    [...tInd].sort((a,b)=>getStatsFor(a).nPrimeiras-getStatsFor(b).nPrimeiras).forEach(p=>{ if(primIds.length<4) primIds.push(p.id); else if(segIds.length<4) segIds.push(p.id); });
+    const fPrefP=foraTurno.filter(p=>p.preferencia==="primeiras"),fPrefS=foraTurno.filter(p=>p.preferencia==="segundas"),fInd=foraTurno.filter(p=>!p.preferencia||p.preferencia==="indiferente");
+    [...fPrefP].sort((a,b)=>getPct(b)-getPct(a)).forEach(p=>{ if(primIds.length<4) primIds.push(p.id); else if(segIds.length<4) segIds.push(p.id); });
+    [...fPrefS].sort((a,b)=>getPct(b)-getPct(a)).forEach(p=>{ if(segIds.length<4) segIds.push(p.id); else if(primIds.length<4) primIds.push(p.id); });
+    [...fInd].sort((a,b)=>getStatsFor(a).nPrimeiras-getStatsFor(b).nPrimeiras).forEach(p=>{ if(primIds.length<4) primIds.push(p.id); else if(segIds.length<4) segIds.push(p.id); });
+    const toA=(ids)=>ids.map(id=>({pessoaId:id,beneficio:"nenhum",porEscolha:false,eraTurno:state.turno.includes(id),balda:false,prefIndiferente:null,sacrificioIndiferente:false}));
+    setPrimeiras(toA(primIds)); setSegundas(toA(segIds));
+    const pP=primIds.map(id=>pessoasPool.find(p=>p.id===id)).filter(Boolean);
+    const sP=segIds.map(id=>pessoasPool.find(p=>p.id===id)).filter(Boolean);
+    setSugP(computeSug(pP,"pctPrimBom","pctPrimMau","pctPrimBalda"));
+    setSugS(computeSug(sP,"pctSegBom","pctSegMau","pctSegBalda"));
+    setStep(2);
+  };
+
+  const setBen=(pid,b,setL)=>setL(prev=>prev.map(a=>a.pessoaId===pid?{...a,beneficio:b}:a));
+  const setEC=(pid,v,setL)=>setL(prev=>prev.map(a=>a.pessoaId===pid?{...a,porEscolha:v}:a));
+  const setPI=(pid,v,setL,parte)=>setL(prev=>prev.map(a=>a.pessoaId===pid?{...a,prefIndiferente:v?parte:null}:a));
+  const setSI=(pid,v,setL)=>setL(prev=>prev.map(a=>a.pessoaId===pid?{...a,sacrificioIndiferente:v}:a));
+  const temBeneficio=(pid)=>{ const ip=primeiras.find(a=>a.pessoaId===pid); const is=segundas.find(a=>a.pessoaId===pid); return (ip&&ip.beneficio!=="nenhum")||(is&&is.beneficio!=="nenhum"); };
+  const moverParte=(pid,de)=>{ if(de==="primeiras"){ const a=primeiras.find(x=>x.pessoaId===pid); setPrimeiras(prev=>prev.filter(x=>x.pessoaId!==pid)); setSegundas(prev=>[...prev,{...a,beneficio:"nenhum",porEscolha:false}]); } else { const a=segundas.find(x=>x.pessoaId===pid); setSegundas(prev=>prev.filter(x=>x.pessoaId!==pid)); setPrimeiras(prev=>[...prev,{...a,beneficio:"nenhum",porEscolha:false}]); } };
+  const canGravar=primeiras.length===4&&segundas.length===4;
+
+  const SugBox=({sug,title})=>(
+    (sug.bomList.length>0||sug.mauList.length>0||sug.baldaList.length>0)?(
+      <div style={{background:"#0d1a0d",border:"1px solid #1d4a1d",borderRadius:6,padding:"8px 10px",marginBottom:10,fontSize:10}}>
+        <div style={{color:"#4ade80",fontWeight:700,marginBottom:4}}>💡 Ordem sugerida:</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6}}>
+          {[["Bom","bomList","#4ade80"],["Mau","mauList","#f87171"],["Balda","baldaList","#f59e0b"]].map(([l,k,c])=>(
+            <div key={k}>
+              <div style={{color:c,fontWeight:700,marginBottom:2}}>{l}</div>
+              {sug[k].map((item,i)=>(
+                <div key={item.nome} style={{color:i===0?c:item.isTurno?"#3a5a3a":"#4a4a2a",marginBottom:1,display:"flex",gap:3,alignItems:"center"}}>
+                  <span>{i+1}. {item.nome}</span>
+                  {!item.isTurno&&<span style={{fontSize:8,color:"#888",background:"#2a2a2a",borderRadius:2,padding:"0 2px"}}>F</span>}
+                  <span style={{opacity:0.5}}>({item.val}%)</span>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      </div>
+    ):null
+  );
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"#000d",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100}} onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:"#0f0f24",border:"1px solid #3d3d7a",borderRadius:16,padding:24,width:"min(760px,98vw)",maxHeight:"95vh",overflowY:"auto"}}>
+        <div style={{fontWeight:900,fontSize:16,color:"#a78bfa",marginBottom:4,letterSpacing:2}}>🌙 REGISTAR NOITE</div>
+        <div style={{fontSize:11,color:"#6b6b9a",marginBottom:14}}>{step===1?"PASSO 1 — Adicionar quem faz a noite":"PASSO 2 — Distribuir e atribuir benefícios"}</div>
+        <label style={LBL}>DATA</label>
+        <input type="date" value={data} onChange={e=>setData(e.target.value)} style={{...INP,marginBottom:16,maxWidth:200}}/>
+
+        {step===1&&(
+          <div>
+            <div style={{display:"flex",gap:8,marginBottom:12}}>
+              <Autocomplete value={search} onChange={setSearch} options={availSearch.map(p=>(state.turno.includes(p.id)?"★ ":"")+p.nome)} onSelect={addToPool} placeholder={pool.length>=8?"Máximo 8 pessoas":"Pesquisar e adicionar..."} disabled={pool.length>=8}/>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <span style={LBL}>PESSOAS DESTA NOITE</span>
+              <span style={{fontSize:12,fontWeight:700,color:pool.length===8?"#4ade80":"#f59e0b"}}>{pool.length}/8</span>
+            </div>
+            {pool.length===0&&<div style={{color:"#4b5563",fontSize:13,textAlign:"center",padding:"20px 0",border:"1px dashed #2a2a4a",borderRadius:8,marginBottom:14}}>Ainda sem pessoas</div>}
+            <div style={{display:"flex",flexDirection:"column",gap:5,marginBottom:16}}>
+              {pool.map(id=>{ const p=pById(id); if(!p) return null; const isTurno=state.turno.includes(p.id); return (
+                <div key={id} style={{display:"flex",alignItems:"center",gap:8,background:"#141428",border:`1px solid ${isTurno?"#4a3a7a":"#2a2a4a"}`,borderRadius:8,padding:"8px 12px"}}>
+                  {isTurno&&<span style={{fontSize:9,background:"#3d2d7a",color:"#c4b5fd",borderRadius:3,padding:"1px 5px",fontWeight:700}}>TURNO</span>}
+                  <span style={{color:pc(p),fontSize:13}}>{pi(p)}</span>
+                  <span style={{flex:1,fontSize:13,fontWeight:600}}>{p.nome}</span>
+                  <button onClick={()=>setPool(prev=>prev.filter(pid=>pid!==id))} style={{background:"transparent",color:"#f87171",border:"none",cursor:"pointer",fontSize:18,lineHeight:1}}>×</button>
+                </div>
+              ); })}
+            </div>
+            <div style={{display:"flex",gap:10,justifyContent:"flex-end"}}>
+              <button onClick={onClose} style={BTN("#2a2a4a")}>Cancelar</button>
+              <button onClick={avancar} disabled={pool.length!==8} style={{...BTN(),opacity:pool.length===8?1:0.4,cursor:pool.length===8?"pointer":"not-allowed"}}>Continuar →</button>
+            </div>
+          </div>
+        )}
+
+        {step===2&&(
+          <div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:14}}>
+              {[{label:"🌑 PRIMEIRAS",lista:primeiras,setL:setPrimeiras,sug:sugP,parteStr:"primeiras"},{label:"🌒 SEGUNDAS",lista:segundas,setL:setSegundas,sug:sugS,parteStr:"segundas"}].map(({label,lista,setL,sug,parteStr})=>(
+                <div key={label} style={{background:"#12122a",borderRadius:10,padding:12,border:"1px solid #2a2a4a"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                    <span style={{fontWeight:900,fontSize:13,color:"#a78bfa",letterSpacing:1}}>{label}</span>
+                    <span style={{fontSize:12,fontWeight:700,color:lista.length===4?"#4ade80":"#f59e0b"}}>{lista.length}/4</span>
+                  </div>
+                  <SugBox sug={sug}/>
+                  <div style={{display:"flex",flexDirection:"column",gap:5}}>
+                    {lista.map(atrib=>{ const p=pById(atrib.pessoaId); if(!p) return null; const isTurno=state.turno.includes(p.id); const contr=p.preferencia!=="indiferente"&&p.preferencia!==parteStr; const isInd=p.preferencia==="indiferente"; const outra=parteStr==="primeiras"?segundas:primeiras; const jaTemNoutra=outra.find(a=>a.pessoaId===p.id&&a.beneficio!=="nenhum"); return (
+                      <div key={atrib.pessoaId} style={{background:contr?"#1a1200":"#0d0d20",border:`1px solid ${isTurno?"#4a3a7a":"#2a2a4a"}`,borderRadius:7,padding:"7px 10px"}}>
+                        <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+                          {isTurno&&<span style={{fontSize:9,background:"#3d2d7a",color:"#c4b5fd",borderRadius:3,padding:"1px 4px",fontWeight:700}}>T</span>}
+                          <span style={{color:pc(p),fontSize:12}}>{pi(p)}</span>
+                          <span style={{flex:1,fontSize:12,fontWeight:600}}>{p.nome}</span>
+                          {contr&&<span style={{fontSize:9,color:"#f59e0b",fontWeight:700}}>≠pref</span>}
+                          <button onClick={()=>moverParte(atrib.pessoaId,parteStr)} style={{background:"#2a2a4a",color:"#a78bfa",border:"none",borderRadius:4,padding:"2px 7px",cursor:"pointer",fontFamily:"inherit",fontSize:10}}>{parteStr==="primeiras"?"→ Seg":"← Prim"}</button>
+                        </div>
+                        <div style={{display:"flex",gap:3,alignItems:"center",flexWrap:"wrap"}}>
+                          {["nenhum","bom","mau"].map(b=>{ const isActive=atrib.beneficio===b; const disabled=!!jaTemNoutra&&b!=="nenhum"&&!isActive; return (
+                            <button key={b} onClick={()=>!disabled&&setBen(atrib.pessoaId,b,setL)} disabled={disabled}
+                              style={{background:isActive?(b==="bom"?"#166534":b==="mau"?"#991b1b":"#374151"):"#0d0d1a",color:b==="bom"?"#4ade80":b==="mau"?"#f87171":"#9ca3af",border:`1px solid ${b==="bom"?"#16a34a":b==="mau"?"#dc2626":"#374151"}`,borderRadius:4,padding:"2px 8px",cursor:disabled?"not-allowed":"pointer",fontFamily:"inherit",fontSize:10,fontWeight:700,opacity:disabled?0.35:1}}>
+                              {b==="nenhum"?"—":b.toUpperCase()}
+                            </button>
+                          ); })}
+                          {contr&&<label style={{display:"flex",alignItems:"center",gap:3,fontSize:10,color:"#facc15",cursor:"pointer",background:"#2a2000",border:"1px solid #f59e0b44",borderRadius:4,padding:"2px 6px"}}><input type="checkbox" checked={!!atrib.porEscolha} onChange={e=>setEC(atrib.pessoaId,e.target.checked,setL)} style={{accentColor:"#facc15"}}/>Escolha</label>}
+                          {isInd&&<>
+                            <label style={{display:"flex",alignItems:"center",gap:3,fontSize:10,color:"#818cf8",cursor:"pointer",background:"#1a1a30",border:"1px solid #818cf844",borderRadius:4,padding:"2px 6px"}}><input type="checkbox" checked={atrib.prefIndiferente===parteStr} onChange={e=>setPI(atrib.pessoaId,e.target.checked,setL,parteStr)} style={{accentColor:"#818cf8"}}/>Preferência</label>
+                            <label style={{display:"flex",alignItems:"center",gap:3,fontSize:10,color:"#fb923c",cursor:"pointer",background:"#2a1a0a",border:"1px solid #fb923c44",borderRadius:4,padding:"2px 6px"}}><input type="checkbox" checked={!!atrib.sacrificioIndiferente} onChange={e=>setSI(atrib.pessoaId,e.target.checked,setL)} style={{accentColor:"#fb923c"}}/>Sacrifício</label>
+                          </>}
+                        </div>
+                      </div>
+                    ); })}
+                  </div>
+                </div>
+              ))}
+            </div>
+            {!canGravar&&<div style={{background:"#2a1a00",border:"1px solid #f59e0b44",borderRadius:6,padding:"8px 12px",fontSize:12,color:"#f59e0b",marginBottom:12}}>⚠️ Primeiras: {primeiras.length}/4 · Segundas: {segundas.length}/4</div>}
+            <div style={{display:"flex",gap:10,justifyContent:"flex-end"}}>
+              <button onClick={()=>setStep(1)} style={BTN("#2a2a4a")}>← Voltar</button>
+              <button onClick={()=>canGravar&&onGravar({data,primeiras,segundas})} disabled={!canGravar} style={{...BTN(),opacity:canGravar?1:0.4,cursor:canGravar?"pointer":"not-allowed"}}>Gravar Noite</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Tab Histórico ────────────────────────────────────────────────────────
+function TabHistorico({state}){
+  const hoje=new Date();
+  const [ano,setAno]=useState(hoje.getFullYear());
+  const [mes,setMes]=useState(hoje.getMonth());
+  const pById=(id)=>state.pessoas.find(p=>p.id===id);
+  const anos=Array.from({length:10},(_,i)=>hoje.getFullYear()-5+i);
+  const noitesMes=[...state.noites].filter(n=>{ const d=new Date(n.data+"T00:00:00"); return d.getFullYear()===ano&&d.getMonth()===mes; }).sort((a,b)=>new Date(a.data)-new Date(b.data));
+  const ordenarP=(l)=>{ const bom=l.filter(a=>a.beneficio==="bom"),mau=l.filter(a=>a.beneficio==="mau"),outros=l.filter(a=>a.beneficio==="nenhum"); return [...bom,...mau,...outros]; };
+  const ordenarS=(l)=>{ const bom=l.filter(a=>a.beneficio==="bom"),mau=l.filter(a=>a.beneficio==="mau"),outros=l.filter(a=>a.beneficio==="nenhum"); return [...outros,...mau,...bom]; };
+  const corCelula=(a,parte)=>{ if(a.beneficio==="nenhum") return {bg:"transparent",color:"#e2e2f0"}; if(parte==="primeiras"&&a.beneficio==="bom") return {bg:"#e6b80022",color:"#e6b800"}; if(parte==="primeiras"&&a.beneficio==="mau") return {bg:"#e6730022",color:"#e67300"}; if(parte==="segundas"&&a.beneficio==="bom") return {bg:"#1a6fbf22",color:"#4aaeff"}; if(parte==="segundas"&&a.beneficio==="mau") return {bg:"#7b2fbf22",color:"#c084fc"}; return {bg:"transparent",color:"#e2e2f0"}; };
+  return (
+    <div>
+      <div style={{display:"flex",gap:12,marginBottom:16,flexWrap:"wrap"}}>
+        <div><label style={LBL}>ANO</label><select value={ano} onChange={e=>setAno(parseInt(e.target.value))} style={{...INP,width:"auto"}}>{anos.map(a=><option key={a} value={a}>{a}</option>)}</select></div>
+        <div><label style={LBL}>MÊS</label><select value={mes} onChange={e=>setMes(parseInt(e.target.value))} style={{...INP,width:"auto"}}>{MESES.map((m,i)=><option key={i} value={i}>{m}</option>)}</select></div>
+      </div>
+      <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:14,fontSize:11}}>
+        {[["Prim. Bom",BEN_COR.primBom],["Prim. Mau",BEN_COR.primMau],["Seg. Bom",BEN_COR.segBom],["Seg. Mau",BEN_COR.segMau]].map(([l,c])=>(
+          <span key={l} style={{display:"flex",alignItems:"center",gap:4}}><span style={{width:12,height:12,background:c,borderRadius:2,display:"inline-block"}}/><span style={{color:"#9ca3af"}}>{l}</span></span>
+        ))}
+      </div>
+      {noitesMes.length===0?<div style={{color:"#6b6b9a",fontSize:13}}>Nenhuma noite em {MESES[mes]} {ano}.</div>:(
+        <div style={{overflowX:"auto"}}>
+          <table style={{borderCollapse:"collapse",fontSize:12,minWidth:"100%"}}>
+            <thead>
+              <tr style={{background:"#e6b800"}}>
+                <th style={{padding:"10px 14px",textAlign:"left",color:"#1a1000",fontWeight:900,letterSpacing:1,minWidth:80}}>NOITES TURNO C — {MESES[mes].toUpperCase()}/{ano}</th>
+                {noitesMes.map(n=>{ const d=new Date(n.data+"T00:00:00"); return (<th key={n.id} style={{padding:"8px 12px",textAlign:"center",color:"#1a1000",fontWeight:900,background:"#e6b800",minWidth:110,borderLeft:"2px solid #fff"}}><div style={{fontSize:10,letterSpacing:1}}>{DIAS_PT_FULL[d.getDay()].toUpperCase()}</div><div style={{fontSize:14}}>{d.getDate()}</div></th>); })}
+              </tr>
+            </thead>
+            <tbody>
+              {[0,1,2,3].map(idx=>(
+                <tr key={`p${idx}`} style={{background:idx%2===0?"#1a1a3e":"#141428"}}>
+                  {idx===0&&<td rowSpan={4} style={{padding:"10px 14px",fontWeight:900,fontSize:20,color:"#e6b800",textAlign:"center",background:"#1a1a3e",borderRight:"2px solid #e6b80033",verticalAlign:"middle",letterSpacing:2}}>I</td>}
+                  {noitesMes.map(n=>{ const ordered=ordenarP(n.primeiras||[]); const atrib=ordered[idx]; if(!atrib) return <td key={n.id} style={{padding:"8px 12px",borderLeft:"1px solid #2a2a4a",minWidth:110}}/>; const p=pById(atrib.pessoaId); const cor=corCelula(atrib,"primeiras"); return (<td key={n.id} style={{padding:"7px 12px",borderLeft:"1px solid #2a2a4a",background:cor.bg,minWidth:110}}><span style={{color:cor.color,fontWeight:atrib.beneficio!=="nenhum"?700:400,fontSize:12}}>{p?.nome||"—"}{atrib.balda?" ⚡":""}</span></td>); })}
+                </tr>
+              ))}
+              <tr><td colSpan={noitesMes.length+1} style={{height:4,background:"#e6b80033"}}/></tr>
+              {[0,1,2,3].map(idx=>(
+                <tr key={`s${idx}`} style={{background:idx%2===0?"#1a1a3e":"#141428"}}>
+                  {idx===0&&<td rowSpan={4} style={{padding:"10px 14px",fontWeight:900,fontSize:20,color:"#4aaeff",textAlign:"center",background:"#1a1a3e",borderRight:"2px solid #4aaeff33",verticalAlign:"middle",letterSpacing:2}}>II</td>}
+                  {noitesMes.map(n=>{ const ordered=ordenarS(n.segundas||[]); const atrib=ordered[idx]; if(!atrib) return <td key={n.id} style={{padding:"8px 12px",borderLeft:"1px solid #2a2a4a",minWidth:110}}/>; const p=pById(atrib.pessoaId); const cor=corCelula(atrib,"segundas"); return (<td key={n.id} style={{padding:"7px 12px",borderLeft:"1px solid #2a2a4a",background:cor.bg,minWidth:110}}><span style={{color:cor.color,fontWeight:atrib.beneficio!=="nenhum"?700:400,fontSize:12}}>{p?.nome||"—"}{atrib.balda?" ⚡":""}</span></td>); })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Tab Estatísticas ─────────────────────────────────────────────────────
+function TabEstatisticas({state}){
+  const [statsSearch,setStatsSearch]=useState("");
+  const [visibleCols,setVisibleCols]=useState({prim:true,seg:true,pBom:true,pMau:true,sBom:true,sMau:true,pBalda:true,sBalda:true,contraria:true});
+  const [showFilter,setShowFilter]=useState(false);
+  const allCols=[["prim","Primeiras"],["seg","Segundas"],["pBom","P.Bom%"],["pMau","P.Mau%"],["sBom","S.Bom%"],["sMau","S.Mau%"],["pBalda","P.Balda%"],["sBalda","S.Balda%"],["contraria","% Sacrifício"]];
+
+  const pessoasTurno=state.pessoas.filter(p=>state.turno.includes(p.id));
+  const pessoasForaFiltradas=state.pessoas.filter(p=>!state.turno.includes(p.id)&&(statsSearch.length===0?false:norm(p.nome).includes(norm(statsSearch))));
+
+  const Row=({p,grupo})=>{
+    const s=calcStats(p,state.noites,state.turno)[grupo];
+    const al=alertasDuasNoites(p.id,state.noites);
+    return (
+      <tr style={{borderBottom:"1px solid #2a2a4a",background:al?"#2a1000":"transparent"}}>
+        <td style={{padding:"7px 10px",fontWeight:700,color:al?"#ff9900":"#e2e2f0",whiteSpace:"nowrap"}}>{al&&"⚠️ "}{p.nome}</td>
+        <td style={{padding:"7px 10px",color:pc(p)}}>{pi(p)}</td>
+        {visibleCols.prim&&<td style={{padding:"7px 10px",color:"#a78bfa"}}>{s.nPrimeiras}</td>}
+        {visibleCols.seg&&<td style={{padding:"7px 10px",color:"#a78bfa"}}>{s.nSegundas}</td>}
+        {visibleCols.pBom&&<td style={{padding:"7px 10px",color:"#e6b800"}}>{s.pctPrimBom}%</td>}
+        {visibleCols.pMau&&<td style={{padding:"7px 10px",color:"#e67300"}}>{s.pctPrimMau}%</td>}
+        {visibleCols.sBom&&<td style={{padding:"7px 10px",color:"#4aaeff"}}>{s.pctSegBom}%</td>}
+        {visibleCols.sMau&&<td style={{padding:"7px 10px",color:"#c084fc"}}>{s.pctSegMau}%</td>}
+        {visibleCols.pBalda&&<td style={{padding:"7px 10px",color:"#f59e0b"}}>{s.pctPrimBalda}%</td>}
+        {visibleCols.sBalda&&<td style={{padding:"7px 10px",color:"#fb923c"}}>{s.pctSegBalda}%</td>}
+        {visibleCols.contraria&&<td style={{padding:"7px 10px",color:p.preferencia!=="indiferente"?"#ffaa44":"#4b5563"}}>{p.preferencia!=="indiferente"?`${s.pctContraria}% (${s.contrariaCount}/${s.totalPref.toFixed(0)})`:"—"}</td>}
+      </tr>
+    );
+  };
+
+  const TableHead=()=>(
+    <tr style={{borderBottom:"2px solid #3d3d7a"}}>
+      {["Pessoa","Pref.",visibleCols.prim&&"Prim.",visibleCols.seg&&"Seg.",visibleCols.pBom&&"P.Bom%",visibleCols.pMau&&"P.Mau%",visibleCols.sBom&&"S.Bom%",visibleCols.sMau&&"S.Mau%",visibleCols.pBalda&&"P.Balda%",visibleCols.sBalda&&"S.Balda%",visibleCols.contraria&&"% Sacrifício"].filter(Boolean).map((h,i)=>(
+        <th key={i} style={{padding:"7px 10px",textAlign:"left",color:"#6b6b9a",letterSpacing:1,whiteSpace:"nowrap"}}>{h}</th>
+      ))}
+    </tr>
+  );
+
+  return (
+    <div>
+      <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
+        <input value={statsSearch} onChange={e=>setStatsSearch(e.target.value)} placeholder="🔍 Pesquisar pessoa fora do turno..." style={{...INP,flex:1,minWidth:200}}/>
+        <div style={{position:"relative"}}>
+          <button onClick={()=>setShowFilter(f=>!f)} style={{...BTN("#2a2a4a"),border:"1px solid #3d3d7a"}}>⚙️ Colunas</button>
+          {showFilter&&(
+            <div style={{position:"absolute",top:"100%",right:0,background:"#1a1a3e",border:"1px solid #5b21b6",borderRadius:8,padding:14,zIndex:50,minWidth:180,boxShadow:"0 8px 24px #0008"}}>
+              {allCols.map(([k,l])=>(
+                <label key={k} style={{display:"flex",alignItems:"center",gap:8,marginBottom:8,cursor:"pointer",fontSize:12,color:"#e2e2f0"}}>
+                  <input type="checkbox" checked={!!visibleCols[k]} onChange={e=>setVisibleCols(v=>({...v,[k]:e.target.checked}))} style={{accentColor:"#a78bfa"}}/>
+                  {l}
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Turno table */}
+      <div style={{fontWeight:700,color:"#a78bfa",marginBottom:8,letterSpacing:1,fontSize:13}}>🏷️ MEMBROS DO TURNO</div>
+      <div style={{overflowX:"auto",marginBottom:24}}>
+        <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+          <thead><TableHead/></thead>
+          <tbody>{pessoasTurno.map(p=><Row key={p.id} p={p} grupo="turno"/>)}</tbody>
+        </table>
+      </div>
+
+      {/* Fora do turno — only shown when searched */}
+      {statsSearch.length>0&&(
+        <>
+          <div style={{fontWeight:700,color:"#6b9a6b",marginBottom:8,letterSpacing:1,fontSize:13}}>👤 FORA DO TURNO</div>
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+              <thead><TableHead/></thead>
+              <tbody>
+                {pessoasForaFiltradas.length===0?<tr><td colSpan={20} style={{padding:"12px 10px",color:"#6b6b9a"}}>Nenhum resultado para "{statsSearch}"</td></tr>:pessoasForaFiltradas.map(p=><Row key={p.id} p={p} grupo="fora"/>)}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────
+function App(){
+  const [state,setState]=useState(()=>{ const raw=load(); if(!raw) return initState(); if(raw.grupos&&!raw.turno) return {...raw,turno:raw.grupos[0]?.membros||[]}; return raw; });
+  const [tab,setTab]=useState("dashboard");
+  const [novaPessoa,setNovaPessoa]=useState("");
+  const [pessoasSearch,setPessoasSearch]=useState("");
+  const [turnoSearch,setTurnoSearch]=useState("");
+  const [alertas,setAlertas]=useState([]);
+  const [perfilPessoa,setPerfilPessoa]=useState(null);
+  const [modalNoite,setModalNoite]=useState(false);
+  const [modalExport,setModalExport]=useState(false);
+  const [editarNoite,setEditarNoite]=useState(null);
+  const importRef=useRef(); const csvRef=useRef();
+
+  useEffect(()=>{ save(state); },[state]);
+  useEffect(()=>{ setAlertas(state.pessoas.filter(p=>alertasDuasNoites(p.id,state.noites)).map(p=>p.nome)); },[state]);
+
+  const pById=(id)=>state.pessoas.find(p=>p.id===id);
+  const getStatsDisplay=(p)=>calcStats(p,state.noites,state.turno);
+
+  const addPessoa=(nome)=>{ const n=(nome||novaPessoa).trim(); if(!n||state.pessoas.find(p=>p.nome.toLowerCase()===n.toLowerCase())) return; setState(s=>({...s,pessoas:[...s.pessoas,{id:Date.now()+""+Math.random(),nome:n,preferencia:"indiferente",historico:{},historicoFora:{}}]})); setNovaPessoa(""); };
+  const remPessoa=(id)=>setState(s=>({...s,pessoas:s.pessoas.filter(p=>p.id!==id),turno:s.turno.filter(t=>t!==id)}));
+  const updPessoa=(id,d)=>setState(s=>({...s,pessoas:s.pessoas.map(p=>p.id===id?{...p,...d}:p)}));
+
+  const importCSV=async(e)=>{ const file=e.target.files[0]; if(!file) return; try{ const nomes=await parseNomesCSV(file); let added=0; setState(s=>{ const novas=[...s.pessoas]; nomes.forEach(nome=>{ if(!novas.find(p=>p.nome.toLowerCase()===nome.toLowerCase())) novas.push({id:Date.now()+""+Math.random()+added++,nome,preferencia:"indiferente",historico:{},historicoFora:{}}); }); return {...s,pessoas:novas}; }); alert(`${nomes.length} nomes processados.`); }catch(err){ alert("Erro: "+err.message); } e.target.value=""; };
+  const addTurno=(nome)=>{ const p=state.pessoas.find(pp=>norm(pp.nome)===norm(nome)||pp.nome===nome); if(!p||state.turno.includes(p.id)) return; setState(s=>({...s,turno:[...s.turno,p.id]})); setTurnoSearch(""); };
+  const remTurno=(id)=>setState(s=>({...s,turno:s.turno.filter(t=>t!==id)}));
+  const gravarNoite=(n)=>{ setState(s=>({...s,noites:[...s.noites,{id:Date.now()+"",data:n.data,primeiras:n.primeiras,segundas:n.segundas}]})); setModalNoite(false); };
+  const remNoite=(id)=>setState(s=>({...s,noites:s.noites.filter(n=>n.id!==id)}));
+  const guardarEdicaoNoite=(noiteEditada)=>{ setState(s=>({...s,noites:s.noites.map(n=>n.id===noiteEditada.id?noiteEditada:n)})); setEditarNoite(null); };
+  const importJSON=(e)=>{ const file=e.target.files[0]; if(!file) return; const reader=new FileReader(); reader.onload=(ev)=>{ try{ const d=JSON.parse(ev.target.result); if(d.pessoas&&d.noites){setState(d);alert("Importado!");}else alert("Ficheiro inválido."); }catch{alert("Erro ao importar.");} }; reader.readAsText(file); e.target.value=""; };
+
+  const TABS=[{id:"dashboard",label:"Dashboard"},{id:"pessoas",label:"Pessoas"},{id:"turno",label:"Turno"},{id:"noites",label:"Noites"},{id:"estatisticas",label:"Estatísticas"},{id:"historico",label:"Histórico"}];
+
+  return (
+    <div style={{fontFamily:"'Courier New',monospace",minHeight:"100vh",background:"#0d0d1a",color:"#e2e2f0"}}>
+      <input ref={importRef} type="file" accept=".json" style={{display:"none"}} onChange={importJSON}/>
+      <input ref={csvRef} type="file" accept=".csv,.txt" style={{display:"none"}} onChange={importCSV}/>
+      <div style={{background:"linear-gradient(135deg,#1a1a3e,#0d0d1a)",borderBottom:"2px solid #3d3d7a",padding:"16px 28px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
+        <div>
+          <div style={{fontSize:20,fontWeight:900,letterSpacing:3,color:"#a78bfa"}}>🌙 GESTÃO DE TURNOS NOTURNOS</div>
+          <div style={{fontSize:10,color:"#6b6b9a",letterSpacing:2}}>BENEFÍCIOS · PRIMEIRAS · SEGUNDAS</div>
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>setModalExport(true)} style={{...BTN("#1a3a1a"),border:"1px solid #2d5a2d",fontSize:11}}>⬇ Exportar</button>
+          <button onClick={()=>importRef.current.click()} style={{...BTN("#1a1a3a"),border:"1px solid #3d3d7a",fontSize:11}}>⬆ Importar</button>
+        </div>
+      </div>
+      {alertas.length>0&&<div style={{background:"#3d1a00",border:"1px solid #ff6600",margin:"12px 28px 0",borderRadius:8,padding:"10px 16px",fontSize:13}}><span style={{color:"#ff9900",fontWeight:700}}>⚠️ ALERTA: </span><span style={{color:"#ffcc88"}}>{alertas.join(", ")} {alertas.length===1?"está":"estão"} a fazer duas noites seguidas com benefício!</span></div>}
+      <div style={{display:"flex",gap:2,padding:"12px 28px 0",borderBottom:"1px solid #2a2a4a",flexWrap:"wrap"}}>
+        {TABS.map(t=><button key={t.id} onClick={()=>setTab(t.id)} style={{background:tab===t.id?"#3d3d7a":"transparent",color:tab===t.id?"#a78bfa":"#6b6b9a",border:"none",borderRadius:"6px 6px 0 0",padding:"8px 16px",cursor:"pointer",fontSize:12,fontWeight:700,letterSpacing:1,fontFamily:"inherit"}}>{t.label}</button>)}
+      </div>
+
+      <div style={{padding:"22px 28px"}}>
+        {tab==="dashboard"&&(
+          <div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:12,marginBottom:22}}>
+              {[{l:"Pessoas",v:state.pessoas.length,i:"👥"},{l:"No Turno",v:state.turno.length,i:"🏷️"},{l:"Noites",v:state.noites.length,i:"🌙"},{l:"Alertas",v:alertas.length,i:"⚠️",red:alertas.length>0}].map(c=>(
+                <div key={c.l} style={{background:c.red?"#3d1a00":"#1a1a3e",border:`1px solid ${c.red?"#ff6600":"#3d3d7a"}`,borderRadius:10,padding:16}}>
+                  <div style={{fontSize:24}}>{c.i}</div><div style={{fontSize:28,fontWeight:900,color:c.red?"#ff9900":"#a78bfa"}}>{c.v}</div><div style={{fontSize:11,color:"#6b6b9a"}}>{c.l}</div>
+                </div>
+              ))}
+            </div>
+            {state.turno.length>0&&<div style={{background:"#0d1f0d",border:"1px solid #2d5a2d",borderRadius:8,padding:"8px 14px",marginBottom:14,fontSize:12,color:"#88cc88"}}>🟢 Turno: {state.turno.map(id=>pById(id)?.nome).filter(Boolean).join(", ")}</div>}
+            <button onClick={()=>setModalNoite(true)} style={{...BTN(),fontSize:14,padding:"14px 32px",letterSpacing:2}}>+ REGISTAR NOVA NOITE</button>
+          </div>
+        )}
+
+        {tab==="pessoas"&&(
+          <div>
+            <div style={{display:"flex",gap:8,marginBottom:8,flexWrap:"wrap"}}>
+              <input value={novaPessoa} onChange={e=>setNovaPessoa(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addPessoa()} placeholder="Nome da pessoa..." style={{...INP,flex:1,minWidth:180}}/>
+              <button onClick={()=>addPessoa()} style={BTN()}>Adicionar</button>
+              <button onClick={()=>csvRef.current.click()} style={{...BTN("#1a3a2a"),border:"1px solid #2d5a2d",fontSize:11}}>📂 Importar CSV</button>
+            </div>
+            <input value={pessoasSearch} onChange={e=>setPessoasSearch(e.target.value)} placeholder="🔍 Pesquisar pessoa..." style={{...INP,marginBottom:12}}/>
+            {state.pessoas.length===0&&<div style={{color:"#6b6b9a"}}>Nenhuma pessoa adicionada.</div>}
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              {[...state.pessoas].filter(p=>norm(p.nome).includes(norm(pessoasSearch))).sort((a,b)=>a.nome.localeCompare(b.nome)).map(p=>{ const al=alertasDuasNoites(p.id,state.noites); const s=getStatsDisplay(p); const noTurno=state.turno.includes(p.id); return (
+                <div key={p.id} style={{background:al?"#2a1000":"#1a1a3e",border:`1px solid ${al?"#ff6600":noTurno?"#4a3a7a":"#3d3d7a"}`,borderRadius:8,padding:"10px 14px",display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                  {noTurno&&<span style={{fontSize:9,background:"#3d2d7a",color:"#c4b5fd",borderRadius:3,padding:"1px 5px",fontWeight:700}}>TURNO</span>}
+                  <span style={{color:pc(p),fontSize:14}}>{pi(p)}</span>
+                  <span style={{fontWeight:700,fontSize:14,flex:1}}>{al&&"⚠️ "}{p.nome}</span>
+                  {p.preferencia!=="indiferente"&&<span style={{fontSize:11,color:"#ffaa44"}}>T:{s.turno.pctContraria}% | F:{s.fora.pctContraria}%</span>}
+                  <button onClick={()=>setPerfilPessoa(p)} style={{...BTN("#2a2a5a"),fontSize:11,padding:"4px 12px"}}>✏️ Perfil</button>
+                  <button onClick={()=>remPessoa(p.id)} style={{background:"#3d1a1a",color:"#ff6b6b",border:"none",borderRadius:4,padding:"4px 12px",cursor:"pointer",fontFamily:"inherit",fontSize:11}}>Remover</button>
+                </div>
+              ); })}
+            </div>
+          </div>
+        )}
+
+        {tab==="turno"&&(
+          <div>
+            <div style={{background:"#0d1020",border:"1px solid #3d3d7a",borderRadius:10,padding:20}}>
+              <div style={{fontWeight:900,fontSize:14,color:"#a78bfa",marginBottom:6,letterSpacing:1}}>GRUPO DE TURNO</div>
+              <div style={{fontSize:12,color:"#6b6b9a",marginBottom:16}}>Pessoas do turno têm SEMPRE prioridade na distribuição e nos benefícios.</div>
+              <div style={{display:"flex",gap:8,marginBottom:16}}>
+                <Autocomplete value={turnoSearch} onChange={setTurnoSearch} options={state.pessoas.filter(p=>!state.turno.includes(p.id)).map(p=>p.nome)} onSelect={nome=>addTurno(nome)} placeholder="Escreva um nome para adicionar ao turno..."/>
+                <button onClick={()=>addTurno(turnoSearch)} style={{...BTN(),whiteSpace:"nowrap"}}>Adicionar</button>
+              </div>
+              <div style={{fontSize:11,color:"#6b6b9a",marginBottom:10}}>MEMBROS ({state.turno.length}):</div>
+              {state.turno.length===0&&<div style={{color:"#4b5563",fontSize:13}}>Nenhum membro no turno.</div>}
+              <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+                {state.turno.map(id=>{ const p=pById(id); if(!p) return null; return (
+                  <div key={id} style={{background:"#2a1a5a",border:"1px solid #a78bfa",borderRadius:8,padding:"8px 14px",display:"flex",alignItems:"center",gap:8}}>
+                    <span style={{color:pc(p)}}>{pi(p)}</span><span style={{fontWeight:700,fontSize:13}}>{p.nome}</span>
+                    <button onClick={()=>remTurno(id)} style={{background:"transparent",color:"#f87171",border:"none",cursor:"pointer",fontSize:18,lineHeight:1}}>×</button>
+                  </div>
+                ); })}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {tab==="noites"&&(
+          <div>
+            <button onClick={()=>setModalNoite(true)} style={{...BTN(),marginBottom:20}}>+ Nova Noite</button>
+            {state.noites.length===0&&<div style={{color:"#6b6b9a"}}>Nenhuma noite registada.</div>}
+            {[...state.noites].sort((a,b)=>new Date(b.data)-new Date(a.data)).map(n=>(
+              <div key={n.id} style={CARD}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:10,flexWrap:"wrap",gap:8}}>
+                  <span style={{fontWeight:900,color:"#a78bfa"}}>🌙 {n.data}</span>
+                  <div style={{display:"flex",gap:8}}>
+                    <button onClick={()=>setEditarNoite(n)} style={{...BTN("#2a2a5a"),fontSize:11,padding:"4px 12px"}}>✏️ Editar</button>
+                    <button onClick={()=>remNoite(n.id)} style={{background:"#3d1a1a",color:"#ff6b6b",border:"none",borderRadius:4,padding:"4px 12px",cursor:"pointer",fontFamily:"inherit",fontSize:11}}>Remover</button>
+                  </div>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                  {["primeiras","segundas"].map(parte=>(
+                    <div key={parte}>
+                      <div style={{fontSize:11,color:"#6b6b9a",marginBottom:6}}>{parte==="primeiras"?"🌑 PRIMEIRAS":"🌒 SEGUNDAS"}:</div>
+                      <div style={{display:"flex",flexDirection:"column",gap:3}}>
+                        {(n[parte]||[]).map(a=>{ const pp=pById(a.pessoaId); if(!pp) return null; const corM={bom:"#16a34a",mau:"#dc2626",nenhum:"#4b5563"}; return (
+                          <div key={a.pessoaId} style={{display:"flex",alignItems:"center",gap:6,fontSize:12}}>
+                            {a.eraTurno&&<span style={{fontSize:8,background:"#3d2d7a",color:"#c4b5fd",borderRadius:2,padding:"1px 4px",fontWeight:700}}>T</span>}
+                            <span style={{color:pc(pp)}}>{pi(pp)}</span>
+                            <span style={{flex:1}}>{pp.nome}</span>
+                            {a.beneficio!=="nenhum"&&<span style={{background:corM[a.beneficio],color:"#fff",borderRadius:3,padding:"1px 6px",fontSize:10,fontWeight:700}}>{a.beneficio.toUpperCase()}</span>}
+                            {a.balda&&<span style={{color:"#f59e0b",fontSize:10}}>⚡</span>}
+                            {a.porEscolha&&<span style={{color:"#facc15",fontSize:10}}>★EC</span>}
+                            {a.prefIndiferente&&<span style={{color:"#818cf8",fontSize:10}}>★PREF</span>}
+                            {a.sacrificioIndiferente&&<span style={{color:"#fb923c",fontSize:10}}>★SAC</span>}
+                          </div>
+                        ); })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {tab==="estatisticas"&&<TabEstatisticas state={state}/>}
+        {tab==="historico"&&<TabHistorico state={state}/>}
+      </div>
+
+      {modalNoite&&<ModalNoite state={state} onClose={()=>setModalNoite(false)} onGravar={gravarNoite}/>}
+      {modalExport&&<ModalExport state={state} onClose={()=>setModalExport(false)}/>}
+      {editarNoite&&<ModalEditarNoite noite={editarNoite} state={state} onSave={guardarEdicaoNoite} onClose={()=>setEditarNoite(null)}/>}
+      {perfilPessoa&&<ModalPerfil pessoa={perfilPessoa} noites={state.noites} turno={state.turno} onClose={()=>setPerfilPessoa(null)} onSave={(d)=>{ updPessoa(perfilPessoa.id,d); setPerfilPessoa(null); }}/>}
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App, null));
+</script>
+</body>
+</html>
